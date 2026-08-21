@@ -20,7 +20,7 @@ export interface JobShopDef {
   name: string
   hourlyWage: number
 }
-// 시급은 이전 대비 약 65~67% 하향(경제 인플레 억제) — 가게별 차등은 유지.
+// 시급은 경제 인플레를 억제하는 수준으로 낮게 잡되, 가게별 차등은 둔다.
 export const JOB_SHOPS: JobShopDef[] = [
   { id: 'bakery', name: '베이커리', hourlyWage: 30 },
   { id: 'flower', name: '꽃집', hourlyWage: 35 },
@@ -86,7 +86,8 @@ const FISH_TABLE: { id: string; weight: number }[] = [
   { id: 'tuna', weight: 10 }
 ]
 const FISH_TOTAL_WEIGHT = FISH_TABLE.reduce((s, f) => s + f.weight, 0)
-const FISH_COOLDOWN_MS = 12_000 // 낚시 쿨다운 — 던진 시점 기산(파밍 속도 제한 = 코인 faucet 통제)
+// 낚시 쿨다운 없음 — 파밍 억제는 입질 대기(2~5초)와 경제 레이트리밋(계정당 10초 30건)이 담당한다.
+const FISH_COOLDOWN_MS = 0
 const BITE_MIN_MS = 2000 // 던진 뒤 입질까지 최소 대기
 const BITE_MAX_MS = 5000 // 입질까지 최대 대기
 const PULL_WINDOW_MS = 1000 // 입질 후 당기기 제한시간(클라 "!" 표시 기준)
@@ -133,7 +134,7 @@ export interface JobShift {
   status: JobShiftStatus // 'done' 은 저장하지 않고 now>=endAt 으로 파생(아래 viewShift)
 }
 interface DailyState {
-  lastDate: string // 'YYYY-MM-DD'(서버 로컬). 같은 날 재수령 차단.
+  lastDate: string // 'YYYY-MM-DD'(UTC 기준 — dayStr 산출값). 같은 날 재수령 차단.
   streak: number
 }
 
@@ -263,7 +264,7 @@ export function createEconomyStore(opts?: { dataDir?: string; persist?: boolean;
         if (d.lastFish && typeof d.lastFish === 'object') lastFish = d.lastFish
       }
     } catch (e) {
-      console.error('[dottown-econ] 로드 실패 — 빈 상태로 시작:', e)
+      console.error('[dottown-econ] 로드 실패. 빈 상태로 시작:', e)
     }
   }
 

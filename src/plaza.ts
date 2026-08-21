@@ -7,8 +7,8 @@ import { randomUUID } from 'node:crypto'
 import type { PlazaActor, PlazaChat, PlazaEntity, PlazaFacing, PlazaJoined, PlazaMoveReq, PlazaTick } from './protocol'
 
 // ===== 맵·밸런싱 상수 =====
-export const PLAZA_ID = 'plaza-main' // v1 단일 인스턴스
-// 맵 크기(타일 16px) — 원본 크기 집(선명·큼)이 겹치지 않게 대폭 확대. 카메라는 플레이어를 따라가는 스크롤 맵.
+export const PLAZA_ID = 'plaza-main' // 단일 인스턴스
+// 맵 크기(타일 16px) — 원본 크기 건물이 겹치지 않을 만큼 넓다. 카메라는 플레이어를 따라가는 스크롤 맵.
 export const PLAZA_COLS = 72 // 맵 가로
 export const PLAZA_ROWS = 64 // 맵 세로
 export const TILE = 16 // 지형 타일 크기(px). 건물 발자국·차단은 타일 단위, 액터 위치는 아래 px 단위.
@@ -44,7 +44,7 @@ export const PLAZA_ENTITIES: PlazaEntity[] = [
   shopBuilding('handmade', '수제마켓', 60),
   // 낚시터 — 스프라이트·발자국 없는 상호작용 스팟(바닥 마커+간판). 근처에서 Space 로 낚시·요리 패널을 연다.
   { id: 'fishing', kind: 'fishing', cx: 36, cy: 54, radius: 1, label: '낚시터' }
-  // 마이룸 포탈은 폐지 — 광장에서 내 마이룸은 '빈터 입주(건물)' 후 그 건물로만 들어간다(무료 지름길 제거).
+  // 마이룸은 '빈터 입주(건물)'로 세운 건물을 통해서만 들어간다(광장에 별도 포탈 없음).
 ]
 
 // 건물 발자국 → 진입 불가 셀 집합("x,y"). 서버 이동검증과 클라 예측이 같은 데이터(entities)에서 같은 규칙으로 계산.
@@ -145,6 +145,8 @@ interface Actor {
   look: unknown
   lastMoveAt: number
   lastEmoteAt: number
+  /** 마지막으로 처리한 클라 move seq — 틱 moves 에 에코해 클라가 '순수 에코'와 '거부'를 구분(러버밴딩 방지). */
+  lastSeq: number
   // 한 계정의 현재 소켓 집합(여러 창·재접속) — 비면 액터 제거. 한 창이 떠나도 다른 창이 있으면 유지.
   sockets: Set<string>
   // 도배 방어(per-actor 슬라이딩 윈도 + 직전 텍스트)
@@ -281,6 +283,7 @@ export function createPlazaHub(opts: {
         look: look ?? null,
         lastMoveAt: 0,
         lastEmoteAt: 0,
+        lastSeq: 0,
         sockets: new Set([socketId]),
         sayWindowStart: 0,
         sayCount: 0,
@@ -294,6 +297,9 @@ export function createPlazaHub(opts: {
       a.sockets.add(socketId)
       a.nick = cleanNick
       a.look = look ?? a.look
+      // seq 카운터 재정렬 — 새로 뜬 클라는 seq 를 0부터 다시 세므로, 잔존 lastSeq(높은 값)를 에코하면
+      // 그 클라가 자기 에코를 영영 대조하지 못해 러버밴딩이 재발한다(근무 잔존/재진입 경로).
+      a.lastSeq = 0
     }
     byPlayer.set(playerId, PLAZA_ID)
     startTimer(inst)
@@ -351,10 +357,12 @@ export function createPlazaHub(opts: {
     if (!inst || !a) return
     // 연속 px 이동 — 맵 경계 안으로 클램프. 인바운드 빈도는 클라 스로틀(80ms) + 100ms 틱 배치로 이미 상한이라
     //   서버 쿨다운은 두지 않는다(정지·방향 전환 메시지를 떨구지 않기 위함).
+    // seq 는 수용/거부와 무관하게 '처리했음'을 에코 — 클라가 이 seq 의 송신 좌표와 대조해 거부만 보정한다.
+    if (typeof req.seq === 'number' && isFinite(req.seq) && req.seq > a.lastSeq) a.lastSeq = req.seq
     const cx = clampPx(req.cx, 0, PLAZA_W - 1)
     const cy = clampPx(req.cy, 0, PLAZA_H - 1)
     if (pxBlocked(cx, cy, blockedUnion)) {
-      inst.changed.add(playerId) // 건물 발자국 안 = 거부(권위 좌표 에코 → 어긋난 클라 스냅백)
+      inst.changed.add(playerId) // 건물 발자국 안 = 거부(권위 좌표 에코 → 어긋난 클라가 보정)
       return
     }
     a.cx = cx
@@ -406,6 +414,7 @@ export function createPlazaHub(opts: {
         look: presence?.look ?? null,
         lastMoveAt: 0,
         lastEmoteAt: 0,
+        lastSeq: 0,
         sockets: new Set(), // 소켓 없음 — 근무 프레즌스(클라 미접속에도 카운터 유지)
         sayWindowStart: 0,
         sayCount: 0,
@@ -465,7 +474,8 @@ export function createPlazaHub(opts: {
           facing: a.facing,
           moving: a.moving,
           working: a.working,
-          ...(a.workShopId ? { workShopId: a.workShopId } : {})
+          ...(a.workShopId ? { workShopId: a.workShopId } : {}),
+          ...(a.lastSeq > 0 ? { seq: a.lastSeq } : {}) // 본인 클라의 에코/거부 판별용(타 클라는 무시)
         })
     }
     const enter: PlazaActor[] = []

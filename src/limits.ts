@@ -1,5 +1,5 @@
 // 서버측 입력 한도 — 신뢰할 수 없는 클라이언트로부터 메모리·소켓버퍼·브로드캐스트 폭증을 막는 보안 방어선.
-// 단일 프레임 자체는 socket.io maxHttpBufferSize(300MB)가 막고, 여기서는 "저장·재브로드캐스트되는"
+// 단일 프레임 자체는 socket.io maxHttpBufferSize(relay 의 48MB)가 막고, 여기서는 "저장·재브로드캐스트되는"
 // 개별 필드를 캡한다. 단일 이미지 캡은 클라(lib/image.ts HANDOUT_IMAGE_MAX_CHARS)와 동일 120MB로 맞춰
 // 정상 업로드는 거부하지 않는다(큰 움짤·이미지 수용 — APNG/WebP 고용량 애니).
 

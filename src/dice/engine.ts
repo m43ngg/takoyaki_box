@@ -1,6 +1,5 @@
-// 이 파일은 렌더러 src/renderer/src/lib/dice/engine.ts 의 미러본입니다.
-//    다이스 규칙 변경 시 양쪽을 함께 수정하세요.
-//    순수 함수 + RNG 주입 구조라 서버 권위 굴림에 그대로 사용합니다.
+// 렌더러 src/renderer/src/lib/dice/engine.ts 의 미러본. 다이스 규칙 변경 시 양쪽을 함께 고친다.
+// 순수 함수 + RNG 주입 구조라 서버 권위 굴림에 그대로 쓴다.
 import type { CheckResult, SanResult, SumResult, SuccessLevel, DiceResult, OpposedResult } from './types'
 import { SUCCESS_LABEL } from './types'
 
@@ -9,8 +8,13 @@ export type RNG = () => number
 
 const defaultRng: RNG = Math.random
 
-/** 성공 단계 판정 (목표값=기능치, roll=1d100). BCDice CC 규칙 준수. */
-export function successLevel(roll: number, target: number): SuccessLevel {
+/**
+ * 성공 단계 판정 (목표값=기능치, roll=1d100).
+ * compare='gte' 는 '목표 이상이 성공'인 룰 — 아래 기본표는 '이하가 성공'이라 그대로 쓰면 결과가 뒤집힌다.
+ * 그 경우 성공·실패 둘로만 가른다(대성공·펌블은 룰마다 달라 함부로 정하지 않는다 · 클라 engine.ts 미러).
+ */
+export function successLevel(roll: number, target: number, compare?: 'lte' | 'gte'): SuccessLevel {
+  if (compare === 'gte') return roll >= target ? 'regular' : 'fail'
   if (roll === 1) return 'critical'
   const fumbleMin = target < 50 ? 96 : 100
   if (roll >= fumbleMin) return 'fumble'
@@ -25,17 +29,32 @@ function rollD100(rng: RNG): number {
   return v === 0 ? 100 : v
 }
 
+/** 한 판정에 걸 수 있는 보너스·페널티 주사위 수의 한계. 규칙이 인정하는 최대가 둘이다. */
+export const MAX_BONUS_DICE = 2
+
 export interface CheckOpts {
-  bonus?: number // 양수=보너스 다이스, 음수=페널티 다이스
+  bonus?: number // 양수=보너스 주사위, 음수=페널티 주사위(하나씩은 서로 지워진다)
   command?: string
   push?: boolean // 밀어붙이기 재시도 굴림
   rng?: RNG
+  /** 성공 방향 — 'gte' 면 목표 이상이 성공(클라 engine.ts 미러). */
+  compare?: 'lte' | 'gte'
 }
 
-/** 기능/능력 판정 (보너스/페널티 다이스 지원) */
+/**
+ * 기능/능력 판정 (보너스/페널티 주사위 지원).
+ *
+ * 규칙: 1자리 주사위 하나는 그대로 두고 **10자리 주사위를 하나 더 굴린다.**
+ *   보너스면 그중 가장 좋은(낮은) 10자리를, 페널티면 가장 나쁜(높은) 10자리를 쓴다.
+ *   1자리를 공유하므로 44 와 24 처럼 뒷자리가 같은 후보들 중에서 고르는 모양이 된다.
+ *   보너스 하나와 페널티 하나는 서로 지워지므로, 부르는 쪽이 그 차(net)를 넘긴다.
+ *
+ * ⚠ 개수는 ±2 로 자른다. 규칙이 인정하는 최대가 둘이기도 하고,
+ *   자르지 않으면 `CC+99999999<=50` 같은 입력 한 줄이 굴림 반복으로 서버를 멈춰 세운다.
+ */
 export function rollCheck(target: number, opts: CheckOpts = {}): CheckResult {
   const rng = opts.rng ?? defaultRng
-  const bonus = opts.bonus ?? 0
+  const bonus = Math.max(-MAX_BONUS_DICE, Math.min(MAX_BONUS_DICE, Math.trunc(opts.bonus ?? 0)))
   const units = Math.floor(rng() * 10)
   const tensCount = 1 + Math.abs(bonus)
   const candidates: number[] = []
@@ -47,10 +66,10 @@ export function rollCheck(target: number, opts: CheckOpts = {}): CheckResult {
   if (bonus > 0) roll = Math.min(...candidates)
   else if (bonus < 0) roll = Math.max(...candidates)
   else roll = candidates[0]
-  const level = successLevel(roll, target)
+  const level = successLevel(roll, target, opts.compare)
   return {
     kind: 'check',
-    command: opts.command ?? `CC<=${target}`,
+    command: opts.command ?? `CC${opts.compare === 'gte' ? '>=' : '<='}${target}`,
     roll,
     rolls: candidates.length > 1 ? candidates : undefined,
     target,
@@ -162,7 +181,7 @@ export interface SumOpts {
 /** 단순 합산 굴림 (피해/혼합 등) */
 export function rollSum(expr: string, opts: SumOpts = {}): SumResult {
   const { rolls, modifier, total } = rollExpr(expr, opts.rng ?? defaultRng)
-  return { kind: 'sum', command: opts.command ?? expr, rolls, modifier, total }
+  return { kind: 'sum', command: opts.command ?? expr, expr, rolls, modifier, total }
 }
 
 /**
@@ -189,17 +208,21 @@ export function resolveInlineRolls(text: string, rng: RNG = defaultRng): string 
 export interface SanOpts {
   rng?: RNG
   command?: string
+  /** 성공 방향 — 'gte' 면 목표 이상이 성공. */
+  compare?: 'lte' | 'gte'
 }
 
 /** 이성(SAN) 판정. lossExpr = "성공측/실패측" (예: "1/1d6") */
 export function rollSan(target: number, lossExpr: string, opts: SanOpts = {}): SanResult {
   const rng = opts.rng ?? defaultRng
   const roll = rollD100(rng)
-  const level = successLevel(roll, target)
-  const success = roll <= target || roll === 1
+  const level = successLevel(roll, target, opts.compare)
+  const success = opts.compare === 'gte' ? roll >= target : roll <= target || roll === 1
   const [sExpr, fExpr] = lossExpr.split('/')
   const expr = success ? sExpr : (fExpr ?? sExpr)
-  const loss = rollExpr(expr, rng).total
+  // 굴린 눈을 함께 남긴다 — 1d6 손실은 합계만 보면 무엇이 나왔는지 알 수 없다.
+  const lossRoll = rollExpr(expr, rng)
+  const loss = lossRoll.total
   return {
     kind: 'san',
     command: opts.command ?? `SC ${lossExpr}<=${target}`,
@@ -208,6 +231,7 @@ export function rollSan(target: number, lossExpr: string, opts: SanOpts = {}): S
     level,
     success,
     loss,
+    ...(lossRoll.rolls.length ? { lossRolls: lossRoll.rolls } : {}),
     lossExpr
   }
 }
@@ -223,6 +247,53 @@ const LEVEL_RANK: Record<SuccessLevel, number> = {
 }
 function isSuccessLevel(l: SuccessLevel): boolean {
   return l !== 'fail' && l !== 'fumble'
+}
+
+/**
+ * 이 룰에서 나올 수 있는 결과 라벨 전부 — 어느 라벨이 더 구체적인지 견주는 데 쓴다.
+ * (카드 이름 '대성공!' 이 '성공' 카드로도 읽히는 것을 가르기 위한 기준표.)
+ */
+export function allCardKeywords(): string[] {
+  return [...Object.values(SUCCESS_LABEL), '성공', '실패', '무승부']
+}
+
+/**
+ * 비주얼 카드 매칭용 키워드 후보 — 주사위 결과에서 카드 이름과 견줄 문자열들을 뽑는다.
+ * 개별 단계 라벨("일반 성공" 등)과 함께 포괄 라벨("성공"/"실패")도 반환해, GM 이 "성공" 카드 하나만
+ * 등록해도 모든 성공 판정에서 컷인이 뜨게 한다(더 구체적인 이름이 앞 = 우선 매칭).
+ * chat:roll 로 온 결과는 커스텀 word/judge 도 실릴 수 있어 방어적으로 읽는다(선언 타입엔 없음).
+ */
+export function diceCardKeywords(dice: DiceResult): string[] {
+  const out: string[] = []
+  const add = (s: unknown): void => {
+    if (typeof s === 'string') {
+      const t = s.trim()
+      if (t) out.push(t)
+    }
+  }
+  const extra = dice as unknown as { word?: unknown; judge?: { ko?: unknown } }
+  if (dice.kind === 'check') {
+    add(dice.label) // 박제 한글(커스텀 프로필 라벨 우선)
+    add(extra.word) // 커스텀 영문 워드(있으면)
+    add(SUCCESS_LABEL[dice.level]) // 표준 단계 한글
+    add(isSuccessLevel(dice.level) ? '성공' : '실패') // 포괄 키워드
+  } else if (dice.kind === 'san') {
+    add(extra.word)
+    add(SUCCESS_LABEL[dice.level])
+    add(dice.success ? '성공' : '실패')
+  } else if (dice.kind === 'opposed') {
+    const win = dice.winner === 'a' ? dice.a : dice.winner === 'b' ? dice.b : null
+    if (win) {
+      add(SUCCESS_LABEL[win.level])
+      add(isSuccessLevel(win.level) ? '성공' : '실패')
+    } else {
+      add('무승부')
+    }
+  } else if (dice.kind === 'sum') {
+    // 2d6 목표판정(클라가 judge 박제) — 그 한글 라벨로 매칭. 순수 합산(피해 등)은 성공/실패 개념 없음.
+    add(extra.judge?.ko)
+  }
+  return [...new Set(out)] // 중복 제거(순서 유지)
 }
 
 export interface OpposedOpts {
@@ -258,19 +329,71 @@ export function rollOpposed(targetA: number, targetB: number, opts: OpposedOpts 
  */
 export function parseCommand(input: string, rng: RNG = defaultRng): DiceResult | null {
   const s = input.trim()
-  let m = s.match(/^(?:SC|SAN)\s+([0-9d+\-/]+)\s*<=\s*(\d+)$/i)
-  if (m) return rollSan(parseInt(m[2], 10), m[1], { rng, command: s })
+  const direct = parseBareCommand(s, s, rng)
+  if (direct) return direct
+  // 후행 괄호 라벨 — 채팅 팔레트 형식 "CC<=50 (근력)". 라벨을 떼어 명령만 판정하고 라벨은 카드의
+  // 이름(name)으로 박제한다(시트 굴림과 동일 표기). 여는 괄호 후보를 왼쪽부터 시도해, 명령 본문에
+  // 괄호가 있는 형태(CBR(60,40)·2*(2d6+6) 등)에 라벨이 붙어도 올바른 분할을 찾는다.
+  if (!/[)）]$/.test(s)) return null
+  for (let i = 1; i < s.length - 1; i++) {
+    const ch = s[i]
+    if (ch !== '(' && ch !== '（') continue
+    const body = s.slice(0, i).trim()
+    if (!body) continue
+    const label = s.slice(i + 1, s.length - 1).trim()
+    // 라벨은 괄호 균형이 맞아야 한다 — "CC<=60 (근력) 2d6 (피해)" 처럼 명령 2개를 이어 쓴
+    // 오입력이 첫 명령+오염된 이름으로 굴려지지 않게(불균형이면 평문 유지). "사격(권총)" 은 통과.
+    if (!label || label.length > 60 || !balancedParens(label)) continue
+    const r = parseBareCommand(body, s, rng)
+    if (r) {
+      if (r.kind !== 'opposed') r.name = label
+      return r
+    }
+  }
+  return null
+}
+
+/** 괄호(반각·전각) 짝이 맞는 문자열인지 — 라벨 후보 검증용. */
+function balancedParens(t: string): boolean {
+  let depth = 0
+  for (const c of t) {
+    if (c === '(' || c === '（') depth++
+    else if (c === ')' || c === '）') {
+      depth--
+      if (depth < 0) return false
+    }
+  }
+  return depth === 0
+}
+
+/** 라벨 없는 명령 본문 파싱 — command 에는 라벨 포함 원문을 그대로 박제한다. */
+function parseBareCommand(s: string, command: string, rng: RNG): DiceResult | null {
+  let m = s.match(/^(?:SC|SAN)\s+([0-9d+\-/]+)\s*(<=|>=)\s*(\d+)$/i)
+  if (m) return rollSan(parseInt(m[3], 10), m[1], { rng, command, compare: m[2] === '>=' ? 'gte' : 'lte' })
   // 대결: CBR(a,b) / 대결(a,b) / 대결 a vs b
   m = s.match(/^(?:CBR|대결)\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)$/i)
-  if (m) return rollOpposed(parseInt(m[1], 10), parseInt(m[2], 10), { rng, command: s })
+  if (m) return rollOpposed(parseInt(m[1], 10), parseInt(m[2], 10), { rng, command })
   m = s.match(/^대결\s+(\d+)\s+vs\s+(\d+)$/i)
-  if (m) return rollOpposed(parseInt(m[1], 10), parseInt(m[2], 10), { rng, command: s })
+  if (m) return rollOpposed(parseInt(m[1], 10), parseInt(m[2], 10), { rng, command })
   // 밀어붙이기: "밀어붙이기 CC<=N" / "push CC<=N"
-  m = s.match(/^(?:밀어붙이기|push)\s+(?:CC|1d100)\s*([+-]\d+)?\s*<=\s*(\d+)$/i)
-  if (m) return rollCheck(parseInt(m[2], 10), { bonus: m[1] ? parseInt(m[1], 10) : 0, push: true, rng, command: s })
-  m = s.match(/^(?:CC|1d100)\s*([+-]\d+)?\s*<=\s*(\d+)$/i)
-  if (m) return rollCheck(parseInt(m[2], 10), { bonus: m[1] ? parseInt(m[1], 10) : 0, rng, command: s })
+  m = s.match(/^(?:밀어붙이기|push)\s+(?:CC|1d100)\s*([+-]\d+)?\s*(<=|>=)\s*(\d+)$/i)
+  if (m)
+    return rollCheck(parseInt(m[3], 10), {
+      bonus: m[1] ? parseInt(m[1], 10) : 0,
+      push: true,
+      rng,
+      command,
+      compare: m[2] === '>=' ? 'gte' : 'lte'
+    })
+  m = s.match(/^(?:CC|1d100)\s*([+-]\d+)?\s*(<=|>=)\s*(\d+)$/i)
+  if (m)
+    return rollCheck(parseInt(m[3], 10), {
+      bonus: m[1] ? parseInt(m[1], 10) : 0,
+      rng,
+      command,
+      compare: m[2] === '>=' ? 'gte' : 'lte'
+    })
   // 합산 굴림 식: 안전 문자(숫자·d·키프드롭 kh/kl/dh/dl·+ - * / 괄호)로만 이뤄지고 주사위(NdM)를 포함.
-  if (/d[1-9]/i.test(s) && /^[0-9dkhl+\-*/() ]+$/i.test(s)) return rollSum(s, { rng })
+  if (/d[1-9]/i.test(s) && /^[0-9dkhl+\-*/() ]+$/i.test(s)) return rollSum(s, { rng, command })
   return null
 }

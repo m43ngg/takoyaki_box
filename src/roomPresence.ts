@@ -21,7 +21,7 @@ const R_MAX_X = ROOM_W - FEET // 발끝 x [14, 200]
 const R_MIN_Y = ROOM_WALL + 6 // 벽 바로 아래 여백
 const R_MAX_Y = ROOM_H - 4 // 발끝 y [100, 184]
 const SPAWN_X = Math.round(ROOM_W / 2) // 107 — 방 중앙
-const SPAWN_Y = 155 // 매트 위(바닥 하단쪽) — 첫 스폰 위치(첨부 이미지 기준)
+const SPAWN_Y = 155 // 매트 위(바닥 하단쪽) — 첫 스폰 위치
 
 // 첫 스폰 px — 매트 위 중앙 하단 근처, 이미 선 방문자와 24px 이상 떨어진 첫 자리(혼잡하면 링 확장).
 function roomSpawn(taken: { x: number; y: number }[]): { cx: number; cy: number } {
@@ -63,6 +63,8 @@ interface Actor {
   look: unknown
   lastMoveAt: number
   lastEmoteAt: number
+  /** 마지막으로 처리한 클라 move seq — 틱 moves 에 에코해 클라가 '순수 에코'와 '거부'를 구분(러버밴딩 방지). */
+  lastSeq: number
   sockets: Set<string> // 이 방에 있는 이 계정의 소켓들(여러 창). 비면 액터 제거.
   sayWindowStart: number
   sayCount: number
@@ -177,6 +179,7 @@ export function createRoomPresenceHub(opts: {
         look: look ?? null,
         lastMoveAt: 0,
         lastEmoteAt: 0,
+        lastSeq: 0,
         sockets: new Set([socketId]),
         sayWindowStart: 0,
         sayCount: 0,
@@ -189,6 +192,8 @@ export function createRoomPresenceHub(opts: {
       a.sockets.add(socketId)
       a.nick = cleanNick
       a.look = look ?? a.look
+      // seq 카운터 재정렬 — 새 클라는 0부터 다시 세므로 잔존 lastSeq 에코가 헛보정을 만들지 않게(광장과 동일).
+      a.lastSeq = 0
     }
     socketRoom.set(socketId, roomId)
     startTimer(inst)
@@ -216,6 +221,8 @@ export function createRoomPresenceHub(opts: {
     const a = inst?.actors.get(playerId)
     if (!inst || !a || !req) return
     // 연속 px 이동 — 바닥(벽 아래) 경계 안으로 클램프. 인바운드 빈도는 클라 스로틀 + 100ms 틱 배치로 이미 상한.
+    // seq 는 수용/클램프와 무관하게 '처리했음'을 에코 — 클라가 송신 좌표와 대조해 거부만 보정한다.
+    if (typeof req.seq === 'number' && isFinite(req.seq) && req.seq > a.lastSeq) a.lastSeq = req.seq
     a.cx = clampPx(req.cx, R_MIN_X, R_MAX_X)
     a.cy = clampPx(req.cy, R_MIN_Y, R_MAX_Y)
     a.lastMoveAt = at
@@ -281,7 +288,15 @@ export function createRoomPresenceHub(opts: {
     const moves: RoomTick['moves'] = []
     for (const pid of inst.changed) {
       const a = inst.actors.get(pid)
-      if (a && !inst.entered.has(pid)) moves.push({ playerId: a.playerId, cx: a.cx, cy: a.cy, facing: a.facing, moving: a.moving })
+      if (a && !inst.entered.has(pid))
+        moves.push({
+          playerId: a.playerId,
+          cx: a.cx,
+          cy: a.cy,
+          facing: a.facing,
+          moving: a.moving,
+          ...(a.lastSeq > 0 ? { seq: a.lastSeq } : {}) // 본인 클라의 에코/거부 판별용(타 클라는 무시)
+        })
     }
     const enter: RoomActor[] = []
     for (const pid of inst.entered) {

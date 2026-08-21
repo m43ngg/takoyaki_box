@@ -3,6 +3,10 @@
 //    ChatMessage 는 렌더러 lib/chat/types.ts 와 동일 구조(클라는 그쪽을 재사용).
 import type { DiceResult, SuccessLevel } from './dice/types'
 
+/** 서버 프로그램 버전(배포 스냅샷 날짜) — GET /health 의 ver 로 노출. 클라이언트가 자가호스팅
+ *  서버의 구버전 여부를 판별하는 근거이므로, 서버 기능이 바뀔 때마다 그 날짜로 갱신한다. */
+export const SERVER_VERSION = '2026-08-20'
+
 export type ChatChannel = 'main' | 'ooc' | 'whisper' | 'group'
 // script = /desc 프로필 없는 꾸미기 스크립트(클라가 아바타·이름 없이 꾸미기 마크업으로 렌더).
 // madness = 광기의 발작 카드(클라가 표를 굴려 결과 payload 전송 — 서버는 그대로 중계).
@@ -16,6 +20,8 @@ export type MessageKind =
   | 'system'
   | 'choice'
   | 'luck'
+  | 'stat'
+  | 'deck'
 
 /** 광기의 발작(CoC 7판) 굴림 결과 — 렌더러 lib/chat/types 의 MadnessRoll 과 동일 구조(미러). */
 export interface MadnessRoll {
@@ -64,6 +70,11 @@ export interface ChatMessage {
   groupId?: string
   /** 비밀 메시지(GM+본인만). 공유 히스토리에 저장하지 않음. */
   secret?: boolean
+  /**
+   * 이 귓속말은 GM 도 볼 수 있다는 각인 — 발화 당시 방이 GM 열람을 켜 두었을 때만 서버가 찍는다.
+   * 열람 판정은 지금의 방 설정이 아니라 이 각인을 보므로, 설정을 뒤늦게 켜도 지난 귓속말은 열리지 않는다.
+   */
+  gmVisible?: boolean
   /** GM 1회성 NPC 발화 — 투명 두상으로 렌더(아바타·캐릭터 매칭 없음). */
   npc?: boolean
   /** GM 선택지 버튼(kind='choice') — 브로드캐스트본은 option.script 제거됨. 색은 게시 시 GM 지정. */
@@ -77,6 +88,11 @@ export interface ChatMessage {
   }
   /** 행운 성공 전환 결과 카드(kind='luck'). */
   luck?: { cost: number; remaining: number; command: string }
+  /** 상태 수치 변화 기록(kind='stat') — 체력·정신력·이성 등이 얼마에서 얼마로 바뀌었는지 한 줄로 남긴다.
+   *  구버전 클라도 빈 줄로 보이지 않게 서버가 text 에 같은 내용을 평문으로 함께 실어 보낸다. */
+  stat?: { label: string; from: number; to: number; max?: number }
+  /** 덱에서 뽑은 카드(kind='deck'). */
+  deck?: DeckPayload
   /** 수정됨 표시 — 작성자/GM 이 본문을 고치면 true. */
   edited?: boolean
   /** 삭제됨 툼스톤 — GM 이 삭제하면 true(본문 제거, "삭제된 메시지"로 렌더). */
@@ -166,6 +182,13 @@ export interface SharedCharacter {
 export type CharUpdateReq = Omit<SharedCharacter, 'playerId'>
 
 /**
+ * char:identity 요청 — 스탠딩을 뺀 '누구로 말하는가'만 담은 가벼운 발행.
+ * 스탠딩은 대형 이미지라 자산 업로드를 기다렸다 나가는데, 그 사이 친 말은 옛 정체성으로 각인된다.
+ * 그래서 업로드가 필요 없는 것만 먼저 보내 이름·색·두상을 즉시 맞추고, 스탠딩은 뒤이은 char:update 가 채운다.
+ */
+export type CharIdentityReq = Omit<CharUpdateReq, 'standings'>
+
+/**
  * 계정 영속용 캐릭터 시트 "전체". 서버는 내용을 해석하지 않고 불투명 블롭으로 저장 —
  * 도메인 타입(능력치·기능 등)은 렌더러 lib/coc/types 소유. id 만 보장. 클라 protocol 과 미러.
  */
@@ -216,11 +239,20 @@ export type TokenLayer = 'behind' | 'bg' | 'token' | 'standing'
 /** 통합 레이어 토큰의 가상 맵 id — 맵세트를 넘어 모든 맵세트에 유지되는 토큰을 이 sentinel 로 라우팅. */
 export const GLOBAL_MAP_ID = '__global__'
 
-/** 토큰/레이어 크기 상한(칸) — 서버 정규화·클라 리사이즈 UI·맵세트 가져오기가 공유(실측 최대 90×60 수용). */
-export const MAX_TOKEN_CELLS = 128
+/**
+ * 토큰/레이어 크기 상한(칸) — 서버 정규화·클라 리사이즈 UI·맵세트 가져오기가 공유.
+ * 외부 맵 도구가 내보낸 방 64개(오브제·마커 2706개)를 집계하니 긴 변이 최대 235칸, 필드는 320칸까지
+ * 쓰인다(128칸 초과 3.4%). 상한이 128이면 그 대형 배경 레이어들이 가져오기에서 잘려
+ * 중심만 남긴 채 작아지고, 다시 내보내도 원래 크기로 복구되지 않는다 — 실측 1125개 중 157개가
+ * 그렇게 어긋났다. 여유를 둬 512 로 잡는다(폭주 좌표 방어는 유지).
+ */
+export const MAX_TOKEN_CELLS = 512
 
-/** z순서 조정 연산. 같은 레이어 안에서 한 칸 앞/뒤(forward/backward) 또는 맨앞/맨뒤(front/back). */
-export type TokenZOp = 'front' | 'back' | 'forward' | 'backward'
+/**
+ * z순서 조정 연산. 한 칸 앞/뒤(forward/backward), 무대 같은 쪽의 맨앞/맨뒤(front/back),
+ * 목록에서 끌어 놓은 자리로 한 번에 옮기기(moveTo — targetId·side 와 함께 쓴다).
+ */
+export type TokenZOp = 'front' | 'back' | 'forward' | 'backward' | 'moveTo'
 
 /**
  * 맵 토큰/오브젝트. 위치는 월드 좌표(px). 캐릭터 토큰이면 charPlayerId 로 roster 의 두상/수치/색/이동권한을
@@ -239,12 +271,17 @@ export interface Token {
   /** 회전 각도(라디안). GM·소유 PL 이 회전 가능(token:rotate). 기본 0. */
   rotation?: number
   charPlayerId?: string
+  /**
+   * 이 토큰이 가리키는 캐릭터(시트) id. 한 사람이 여러 저널을 오가며 쓰는 방에서, 토큰마다 어느
+   * 캐릭터의 것인지 붙잡아 둔다. 없으면 예전처럼 그 사람이 지금 장착한 캐릭터를 따라간다.
+   */
+  charId?: string
   label?: string
   color?: string
   image?: string // data URL (NPC 토큰·이미지 오브젝트)
   layer?: TokenLayer
   z?: number
-  /** 좌우 반전(이미지 토큰 미러 · /). 기본 false. */
+  /** 좌우 반전(이미지 토큰 미러). 기본 false. */
   flipX?: boolean
   /** 이름표 숨김(GM 전용 토글·전원 동기화). true 면 토큰 이름 미표시. */
   hideName?: boolean
@@ -285,6 +322,11 @@ export interface Token {
   /** 라이브 스탠딩 토큰 — 캐릭터(charPlayerId)의 현재 표정 스탠딩 이미지를 그린다(로스터 참조 ·
    *  표정 교체 시 즉시 반영). 레이어 이동과 무관하게 이 플래그로만 판별. */
   liveStanding?: boolean
+  /** 버튼 토큰: 마우스 hover 시 hoverImage, 클릭(press) 시 pressImage 로 바꿔 보여준다(뷰어별 로컬).
+   *  기본(1번) 이미지는 image/images 사용. sounds=상태 진입 시 재생할 효과음(asset ref/data URL). */
+  hoverImage?: string
+  pressImage?: string
+  sounds?: { base?: string; hover?: string; press?: string }
 }
 
 /** 토큰 커스텀 상태바 — 이름·현재/최대·색(없으면 인덱스 팔레트). 현재값이 최대의 80% 미만이면 빨간 경고색. */
@@ -294,6 +336,9 @@ export interface TokenBar {
   cur: number
   max: number
   color?: string
+  /** 캐릭터 시트 수치와 연동 — 지정하면 cur/max 대신 그 캐릭터의 살아 있는 값을 그린다(시트를 고치면 맵도 따라간다).
+   *  토큰에 캐릭터가 안 붙어 있거나 그 수치가 없으면 저장된 cur/max 로 되돌아간다. */
+  link?: 'hp' | 'mp' | 'san'
 }
 
 /** token:upsert 요청 (GM 전용). id 없으면 신규 생성. mapId=대상 맵. layer=배치 레이어(이미지 오브젝트). */
@@ -307,6 +352,7 @@ export interface TokenUpsertReq {
   h?: number
   rotation?: number
   charPlayerId?: string
+  charId?: string
   label?: string
   color?: string
   image?: string
@@ -328,6 +374,12 @@ export interface TokenUpsertReq {
   bars?: TokenBar[]
   statsPrivate?: boolean
   liveStanding?: boolean
+  hoverImage?: string
+  pressImage?: string
+  sounds?: { base?: string; hover?: string; press?: string }
+  /** 표시 맵 제한(통합 레이어 전용) — 배열이면 그 맵에서만 보임, null 이면 제한 해제(모든 맵),
+   *  미지정이면 기존 값 보존. 가져오기가 박아 둔 제한을 사람이 풀 수 있는 유일한 손잡이다. */
+  mapIds?: string[] | null
 }
 
 /** token:move 요청 (GM 또는 토큰 소유 PL). 잦은 이벤트 → 위치만 전송. mapId=대상 맵. */
@@ -358,6 +410,11 @@ export interface TokenReorderReq {
   id: string
   op?: TokenZOp
   layer?: TokenLayer
+  /** 지금 보고 있는 맵 — 통합 레이어와 이 맵의 레이어를 한 줄로 놓고 순서를 매긴다. 없으면 mapId 안에서만. */
+  sceneMapId?: string
+  /** op='moveTo' 의 기준 토큰. 이 토큰의 앞(side='front') 또는 뒤(side='back')로 옮긴다. */
+  targetId?: string
+  side?: 'front' | 'back'
 }
 
 /** token:imageindex 요청 (GM 또는 토큰 소유 PL · 이동과 동일 권한). 이미지 카드의 표시 이미지 전환. index=images 인덱스. */
@@ -536,13 +593,79 @@ export interface CombatState {
 }
 
 /**
- * 그룹 채널(GM 개설) — members(+GM)에게만 보이고 전달됨. 채널 자체는 영속,
- * 메시지는 휘발(귓속말처럼 공유 히스토리 미저장). 클라 protocol 과 미러.
+ * 그룹 채널(GM 개설) — members(+GM)에게만 보이고 전달됨. 채널과 메시지 모두 영속이며,
+ * 귓속말과 같이 히스토리에 저장하되 내보낼 때 뷰어별로 거른다(재입장 보존). 클라 protocol 과 미러.
  */
 export interface Channel {
   id: string
   name: string
   members: string[] // playerId[] (GM 은 항상 접근)
+}
+
+
+/** 덱 카드 한 장의 정의(GM 이 짠다). count 로 같은 카드를 여러 장 넣는다. */
+export interface DeckCard {
+  id: string
+  name: string
+  /** 카드 앞면 그림(자산 참조 또는 data URL). 없으면 이름만으로 그린다. */
+  image?: string
+  /** 카드 설명 — 뽑은 결과에 함께 적힌다. */
+  text?: string
+  /** 이 카드를 덱에 몇 장 넣는지(1~99). 미설정=1장. */
+  count?: number
+}
+
+/**
+ * 덱(카드 뭉치)의 공개본 — 참가자에게 내보내는 형태.
+ * 남은 더미의 '순서'는 절대 싣지 않는다(다음에 무엇이 나올지가 그대로 새어 나간다). 장수만 알린다.
+ */
+export interface DeckView {
+  id: string
+  name: string
+  /** 카드 정의 — revealCards 가 꺼져 있으면 참가자에게는 빈 배열로 나간다. */
+  cards: DeckCard[]
+  /** 아직 뽑지 않고 남은 장수. */
+  remaining: number
+  /** 전체 장수(count 합). */
+  total: number
+  /** 버린 더미 — 이미 뽑혀 공개된 카드의 정의 id, 뽑은 순서대로. */
+  discard: string[]
+  /** 뽑기 결과를 채팅에 남길지. 끄면 덱 창에만 남는다. */
+  announce: boolean
+  /** 다 뽑으면 자동으로 다시 섞을지. */
+  reshuffle: boolean
+  /** 카드 목록을 참가자에게 보일지. 끄면 이름과 남은 장수만 보인다. */
+  revealCards: boolean
+  /** 누가 뽑을 수 있는지 — all=전원, gm=GM 만. */
+  who: 'all' | 'gm'
+  createdAt: number
+}
+
+/** deck:upsert 요청(GM 전용). id 없으면 새 덱. 카드 구성이 바뀌면 서버가 더미를 다시 섞는다. */
+export interface DeckUpsertReq {
+  id?: string
+  name: string
+  cards: DeckCard[]
+  announce?: boolean
+  reshuffle?: boolean
+  revealCards?: boolean
+  who?: 'all' | 'gm'
+}
+
+/** deck:draw 요청. count=뽑을 장수(1~10), secret=GM 과 뽑은 사람에게만. */
+export interface DeckDrawReq {
+  id: string
+  count?: number
+  secret?: boolean
+}
+
+/** 뽑기 결과 카드(kind='deck') — 채팅에 남는 몫. */
+export interface DeckPayload {
+  deckName: string
+  /** 뽑은 카드들(뽑은 순서). */
+  cards: { name: string; image?: string; text?: string }[]
+  /** 뽑고 난 뒤 남은 장수. */
+  remaining: number
 }
 
 /** 방 전체 스냅샷 (입장/재접속 ack 로 전달). handouts 는 요청자 기준으로 필터링됨. */
@@ -564,10 +687,20 @@ export interface RoomState {
   /** 세션방 이름·소유자 계정·카드 이미지(서버 영속 메타). */
   title: string
   ownerId: string
+  /** 공동 GM 계정 id — 소유자는 언제나 GM 이라 여기 담기지 않는다. 옛 서버는 안 보낸다. */
+  gmIds?: string[]
   cardImage?: string
   participants: Participant[]
   characters: SharedCharacter[]
+  /**
+   * 캐릭터 보관대 — 지금 아무도 장착하지 않은 캐릭터까지 담는다.
+   * 맵 토큰이 charId 로 자기 캐릭터를 찾을 때 쓴다(로스터에 없으면 여기서). 옛 서버는 안 보낸다.
+   */
+  charPool?: SharedCharacter[]
   messages: ChatMessage[]
+  /** 여기 실린 대화보다 앞선 몫이 보관소에 남아 있는가 — 채팅 창의 '보관된 이전 대화 불러오기' 표시 조건.
+   *  옛 서버는 안 보낸다(그 경우 보관소 자체가 없다). */
+  archived?: boolean
   handouts: Handout[]
   /** 방의 모든 맵세트. */
   maps: GameMap[]
@@ -575,6 +708,8 @@ export interface RoomState {
   activeMapId: string
   /** 방 외형(방 GM 강제 테마·다이스 카드). 입장 시 클라가 적용. */
   appearance: Appearance
+  /** 입실 잠금(공사중) — 켜면 방을 만든 사람 말고는 새로 들어올 수 없다. GM 토글·전원 동기화·영속. */
+  locked?: boolean
   /** 방 BGM 트랙들(GM 제어·전원 동기화). 빈 배열=정지/없음. 최대 5개 동시재생. 입장 시 클라가 적용. */
   bgm: BgmState[]
   /** 방 전투 상태(GM 제어·전원 동기화). null=전투 없음. */
@@ -589,10 +724,15 @@ export interface RoomState {
   dimColor?: string
   /** 요청자의 이 방 캐릭터 시트 멤버십 — 이 charId 들만 방에서 보임(라이브러리에서 가져온 것). */
   charRoomIds: string[]
+  /** 이 뷰어가 이미 고른 GM 선택지(메시지 id → 옵션 id). 재입장해도 잠금이 되살아난다.
+   *  값이 빈 문자열이면 '고르긴 했으나 무엇인지 모름'(구버전 저장본). 구버전 서버 응답엔 없음. */
+  choiceLocks?: Record<string, string>
   /** 저장 슬롯 메타(반면 전체 명명 저장 · 최대 3). 목록 표시용 — 맵 본문 제외. */
   saveSlots?: { id: string; name: string; savedAt: number }[]
   /** 비주얼 카드 목록 — GM 등록·전원 동기화. */
   visualCards?: VisualCard[]
+  /** 덱(카드 뭉치) 목록 — 남은 더미 순서는 빠진 공개본. */
+  decks?: DeckView[]
   /** 통합 레이어 토큰 — 맵세트를 넘어 모든 맵세트에 유지·표시. */
   globalTokens?: Token[]
   /** GM 커스텀 광기표 — 미설정이면 클라 기본 7판 표 사용. 전원 동기화. */
@@ -601,6 +741,8 @@ export interface RoomState {
   luckEnabled?: boolean
   /** 일반 맵 VN 오버레이(대사창+발화자 스탠딩) 표시 — GM 토글·전원 동기화. 미설정/false=꺼짐, true=켜짐. */
   vnOverlay?: boolean
+  /** GM 귓속말 열람 — GM 토글·전원 동기화. 미설정/false=꺼짐. 켠 뒤에 오가는 귓속말만 GM 에게 열린다. */
+  gmSeeWhispers?: boolean
   /** 채팅 두상 풀 — messages 의 avatarRef 가 가리키는 두상 data URL 목록(스냅샷 크기 절감). */
   avatarPool?: string[]
 }
@@ -611,7 +753,8 @@ export interface RoomSummary {
   code: string
   title: string
   cardImage?: string
-  owner: boolean // 요청 계정이 소유자(=GM)인지
+  owner: boolean // 요청 계정이 소유자인지(삭제·복사·이름 변경은 소유자만)
+  gm?: boolean // 요청 계정이 이 방의 GM 인지(소유자 또는 공동 GM). 옛 서버는 안 보낸다
   memberCount: number
   online: number // 현재 접속 인원
   updatedAt: number
@@ -677,6 +820,27 @@ export interface ChatRollReq {
   secret?: boolean
 }
 
+/**
+ * 보관된 지난 대화 되읽기 요청.
+ * 방이 메모리에 들고 있는 몫보다 앞선 대화는 보관소에 남아 있고, 이 요청으로 뒤에서부터 한 묶음씩 가져온다.
+ */
+export interface ChatOlderReq {
+  /** 이어 읽을 지점 — 앞선 응답이 준 것을 그대로 돌려준다. 없으면 보관소의 맨 끝부터. */
+  cursor?: { part: number; line: number }
+  /** 한 번에 받을 대화 수(서버가 상한으로 깎는다). */
+  limit?: number
+}
+
+/** 되읽기 응답 — 입장 스냅샷과 같은 꼴(두상은 풀로 분리). */
+export interface ChatOlderRes {
+  /** 오래된 순으로 정렬된 보관 대화. 열람권이 없는 것은 빠져 있다. */
+  messages: ChatMessage[]
+  /** 두상 풀 — messages 의 avatarRef 가 가리킨다(입장 스냅샷과 동일). */
+  avatarPool?: string[]
+  /** 다음에 이어 읽을 지점. null 이면 보관소를 끝까지 읽었다. */
+  cursor: { part: number; line: number } | null
+}
+
 /** 핸드셰이크 시 socket.handshake.auth 로 전달. */
 export interface HandshakeAuth {
   /** 세션 토큰(계정 인증). requireAuth 모드에선 필수 — 없거나 무효면 연결 거부. */
@@ -719,10 +883,11 @@ export interface PlazaMoveReq {
   seq: number
 }
 
-/** 서버→클라 틱(배치). moves=이번 틱 변화 액터, enter=새로 들어온 액터(외형 포함), leave=퇴장 playerId. 클라 protocol 과 미러. */
+/** 서버→클라 틱(배치). moves=이번 틱 변화 액터, enter=새로 들어온 액터(외형 포함), leave=퇴장 playerId.
+ *  seq=그 액터의 마지막 처리 move seq(본인 클라의 에코/거부 판별용 — 타 클라는 무시). 클라 protocol 과 미러. */
 export interface PlazaTick {
   plazaId: string
-  moves: { playerId: string; cx: number; cy: number; facing: PlazaFacing; moving: boolean; working: boolean; workShopId?: string }[]
+  moves: { playerId: string; cx: number; cy: number; facing: PlazaFacing; moving: boolean; working: boolean; workShopId?: string; seq?: number }[]
   enter: PlazaActor[]
   leave: string[]
 }
@@ -811,10 +976,10 @@ export interface RoomMoveReq {
   seq: number
 }
 
-/** 서버→클라 방문 틱(배치). 클라 protocol 과 미러. */
+/** 서버→클라 방문 틱(배치). seq=그 액터의 마지막 처리 move seq(본인 에코/거부 판별용). 클라 protocol 과 미러. */
 export interface RoomTick {
   roomId: string
-  moves: { playerId: string; cx: number; cy: number; facing: PlazaFacing; moving: boolean }[]
+  moves: { playerId: string; cx: number; cy: number; facing: PlazaFacing; moving: boolean; seq?: number }[]
   enter: RoomActor[]
   leave: string[]
 }
@@ -839,21 +1004,34 @@ export interface RoomJoined {
 }
 
 export interface ClientToServerEvents {
+  // 커뮤니티 — 보고 있는 게시판·글의 룸으로 갈아탄다. 이전 룸은 반드시 떠난 뒤 들어간다(이중 소속 누수 방지).
+  'cmty:watch': (req: { boardId?: string; postId?: string }) => void
+  'cmty:unwatch': () => void
   'room:create': (req: CreateRoomReq, ack: Ack<JoinedRoom>) => void
   'room:join': (req: JoinRoomReq, ack: Ack<JoinedRoom>) => void
   'room:leave': () => void
   // 세션방 목록·관리 (서버 영속, 인증 계정 기준). setMeta/delete/duplicate/clearChat=소유자만(서버 검증).
   'room:list': (ack: Ack<RoomSummary[]>) => void
   'room:enter': (req: { roomId: string; nick: string; color: string }, ack: Ack<JoinedRoom>) => void
+  // 부재 멤버 목록(GM 전용) — 입장 이력은 있으나 지금 방에 없는 계정(부재 PL 시트로 스탠딩 배치용).
+  'room:absentMembers': (ack: Ack<{ playerId: string; nick: string }[]>) => void
   'room:setMeta': (req: { roomId: string; title?: string; cardImage?: string | null }, ack: Ack<RoomSummary>) => void
   'room:delete': (req: { roomId: string }, ack: Ack<{ id: string }>) => void
+  // 참가자 본인이 방 멤버십에서 탈퇴('내 세션 목록'에서 제거). 소유자는 불가(삭제/유지만).
+  'room:leaveMembership': (req: { roomId: string }, ack: Ack<{ id: string }>) => void
   'room:duplicate': (req: { roomId: string }, ack: Ack<RoomSummary>) => void
   'room:clearChat': (req: { roomId: string }, ack: Ack<{ id: string }>) => void
+  // 공동 GM 지정·해제 — 방을 만든 사람만. 대상은 이 방에 들어온 적 있는 계정(=playerId).
+  'room:gm:set': (req: { playerId: string; gm: boolean }, ack: Ack<{ ok: true }>) => void
+  // 방 양도 — 방을 만든 사람만. 넘긴 사람은 공동 GM 으로 남는다.
+  'room:gm:transfer': (req: { playerId: string }, ack: Ack<{ ok: true }>) => void
   'chat:send': (req: ChatSendReq) => void
   // 클라가 굴린 결과(시트 주사위·광기) 중계 — 서버가 정체성 스탬프·라우팅·히스토리·브로드캐스트.
   'chat:roll': (req: ChatRollReq) => void
   // 행운 성공 전환 안내 — 서버가 정체성 스탬프 후 kind='luck' 카드로 브로드캐스트(공개·히스토리).
-  'chat:luck': (req: { channel: ChatChannel; cost: number; remaining: number; command: string }) => void
+  'chat:luck': (req: { channel: ChatChannel; groupId?: string; cost: number; remaining: number; command: string }) => void
+  // 상태 수치 변화 기록 — 시트에서 체력·정신력·이성이 바뀌면 방 기록에 한 줄 남긴다(서버가 발신자 정체성 스탬프).
+  'chat:stat': (req: { channel: ChatChannel; label: string; from: number; to: number; max?: number }) => void
   // GM 선택지 — 채팅에 버튼 선택지 게시. 서버는 옵션 스크립트를 숨기고 라벨만 브로드캐스트. 색은 그대로 전달.
   'chat:choice': (req: {
     prompt: string
@@ -863,15 +1041,20 @@ export interface ClientToServerEvents {
     textColor?: string
     promptColor?: string
   }) => void
-  // 플레이어가 선택지 버튼 클릭 — 1회만. 서버: GM 비공개 통지 +(스크립트 있으면)본인 출력 + choice:locked.
+  // 선택지 버튼 클릭 — 사람당 1회(GM 포함). 서버: GM·본인에게만 보이는 통지(히스토리 저장) +(스크립트 있으면)본인 출력 + choice:locked.
   'choice:select': (req: { messageId: string; optionId: string }) => void
   // 보낸 채팅 수정/삭제. 수정=작성자 본인 또는 GM(텍스트 메시지만), 삭제=GM 만. 서버가 검증 후 브로드캐스트.
   'chat:edit': (req: { id: string; text: string }) => void
   'chat:delete': (req: { id: string }) => void
+  // 보관된 지난 대화 되읽기 — 방이 메모리에 들고 있는 몫보다 앞선 대화를 뒤에서부터 한 묶음씩.
+  // cursor 는 서버가 준 것을 그대로 돌려주면 되고, 없으면 보관소의 맨 끝부터. 열람권은 서버가 거른다.
+  'chat:older': (req: ChatOlderReq, ack: Ack<ChatOlderRes>) => void
   // 입력 중 표시(휘발) — 타이핑 시작/정지를 방 전체에 알림(저장 안 함). channel/groupId 로 어느 탭에서 치는지 전달.
   'chat:typing': (req: { typing: boolean; channel?: ChatChannel; groupId?: string }) => void
   // 캐릭터 프레즌스 공유. playerId 는 서버가 스탬프.
   'char:update': (req: CharUpdateReq) => void
+  // 스탠딩을 뺀 정체성만 즉시 반영(업로드 대기 없음) — 갈아입자마자 친 말이 옛 캐릭터로 찍히지 않게.
+  'char:identity': (req: CharIdentityReq) => void
   'char:expr': (req: { index: number }) => void
   // 캐릭터 시트 영속 (인증 계정 전용). 시트 전체를 계정에 저장/삭제.
   'char:save': (req: CharacterRecord) => void
@@ -900,8 +1083,12 @@ export interface ClientToServerEvents {
   // GM 전용: ~문장~ 행동지문 색 설정/해제(빈값=해제). 전원 동기화.
   'room:dim': (req: { color?: string }) => void
   'room:luck': (req: { enabled: boolean }) => void
+  /** 입실 잠금(공사중) — 방을 만든 사람만 켜고 끈다. 켜면 새로 들어오는 사람을 막는다. */
+  'room:lock': (req: { locked: boolean }) => void
   // GM 전용: 일반 맵 VN 오버레이 표시 토글. 전원 동기화.
   'room:vnoverlay': (req: { enabled: boolean }) => void
+  // GM 전용: GM 귓속말 열람 토글. 켠 뒤에 오가는 귓속말만 GM 에게 열린다(지난 말은 소급 열람 없음).
+  'room:gmwhisper': (req: { enabled: boolean }) => void
   // GM 커스텀 광기표 설정(GM 전용) — 서버 정규화 후 전원 동기화.
   'room:madness': (req: MadnessTables) => void
   // BGM (다중, GM 전용). set=트랙 추가/로드(소스 포함·최대 5), control=해당 트랙 재생/반복/볼륨 토글, clear=한 트랙(trackId) 또는 전체 정지.
@@ -930,8 +1117,10 @@ export interface ClientToServerEvents {
   'handout:upsert': (req: HandoutUpsertReq) => void
   'handout:delete': (req: { id: string }) => void
   'handout:focus': (req: { id: string }) => void
-  // 맵·토큰 . 맵 관리·배경·그리드·배치·삭제는 GM, 이동은 GM 또는 토큰 소유 PL — 서버 검증.
-  'map:create': (req: { name?: string }) => void
+  // 맵·토큰 — 맵 관리·배경·그리드·배치·삭제는 GM, 이동은 GM 또는 토큰 소유 PL(서버 검증).
+  /** baseMapId: 새 맵이 통합 레이어의 '표시 맵 제한'을 이어받을 기준 맵. 맵 전환은 개인 뷰라
+   *  서버의 activeMapId 는 그 사람이 보고 있는 맵이 아니다 — 미지정이면 activeMapId 로 폴백. */
+  'map:create': (req: { name?: string; baseMapId?: string }) => void
   'map:delete': (req: { mapId: string }) => void
   'map:rename': (req: { mapId: string; name: string }) => void
   'map:activate': (req: { mapId: string }) => void
@@ -974,11 +1163,17 @@ export interface ClientToServerEvents {
   'token:imageindex': (req: TokenImageIndexReq) => void
   'token:remove': (req: { mapId: string; id: string }) => void
   'token:reorder': (req: TokenReorderReq) => void
-  // 자유 드로잉·핑 . 그리기=전원, 지우개=작성자/GM, 전체 지우기=GM, 핑=전원(휘발).
+  // 덱(카드 뭉치) — 만들기/고치기·삭제·섞기는 GM 만, 뽑기는 덱 설정(who)에 따라.
+  // 남은 더미의 순서는 서버만 알고 있으며, 뽑기도 서버가 처리한다(무한 뽑기·엿보기 방지).
+  'deck:upsert': (req: DeckUpsertReq) => void
+  'deck:delete': (req: { id: string }) => void
+  'deck:shuffle': (req: { id: string }) => void
+  'deck:draw': (req: DeckDrawReq) => void
+  // 자유 드로잉·핑 — 그리기=전원, 지우개=작성자/GM, 전체 지우기=GM, 핑=전원(휘발).
   'map:draw': (req: DrawReq) => void
   'map:draw:erase': (req: { mapId: string; strokeId: string }) => void
   'map:draw:clear': (req: { mapId: string }) => void
-  // 맵 텍스트 . 생성=전원, 편집/이동/삭제=작성자/GM, 전체 지우기=GM — 서버 검증.
+  // 맵 텍스트 — 생성=전원, 편집/이동/삭제=작성자/GM, 전체 지우기=GM(서버 검증).
   'map:text': (req: MapTextUpsertReq) => void
   'map:text:move': (req: { mapId: string; id: string; x: number; y: number }) => void
   'map:text:remove': (req: { mapId: string; id: string }) => void
@@ -1003,19 +1198,60 @@ export interface ClientToServerEvents {
   'roomvisit:move': (req: RoomMoveReq) => void
   'roomvisit:say': (req: { text: string }) => void
   'roomvisit:emote': (req: { emote: string }) => void
+  // 수동 프레즌스 상태 설정(인증 계정). 계정 영속 — 재접속 후에도 유지.
+  'presence:set': (req: { status: PresenceStatus }, ack?: Ack<{ status: PresenceStatus }>) => void
 }
 
-/** DM(유저 간 다이렉트 메시지) 1건. from/to=userId(=계정 id). */
+/** DM(유저 간 다이렉트 메시지) 1건. from/to=userId(=계정 id). 그룹 메시지는 to='' + threadId 스탬프. */
 export interface DmMessage {
   id: string
   from: string
+  /** 그룹 메시지는 '' — 구버전 클라가 자기 앞 메시지가 아니라고 판단해 자연 무시(하위호환). */
   to: string
   text: string
   createdAt: number
+  /** 그룹 DM 스레드 id. 1:1 메시지에는 없음(기존 스킴 유지). */
+  threadId?: string
+}
+
+/** 수동 프레즌스 상태. invisible 은 본인에게만 노출(외부엔 오프라인으로 위장). */
+export type PresenceStatus = 'online' | 'away' | 'session' | 'invisible'
+/** 외부에 표시되는 상태(invisible 제외). */
+export type PublicPresenceStatus = 'online' | 'away' | 'session'
+
+/** 로비 알림 종류 — comment=내 블로그 글 댓글, reply=내 댓글 답글, guestbook=홈/로비 방명록,
+ *  dtguestbook=도트타운 마이룸 방명록, friend=친구 신청/수락, dm=새 다이렉트 메시지(상대별 최신 1건). */
+// 커뮤니티 알림은 종류를 하나로 두고 세부는 본문에 담는다 — 이름이 갈리면 딥링크가 런타임에만 깨진다.
+export type NotifKind = 'comment' | 'reply' | 'guestbook' | 'dtguestbook' | 'friend' | 'dm' | 'cmty' | 'signup'
+/** 로비 알림 1건 — 서버 notifications 저장 항목과 동일(읽음은 서버 권위). */
+export interface NotifItem {
+  id: string
+  kind: NotifKind
+  /** 알림을 발생시킨 사람(작성 시점 스냅샷 — 탈퇴해도 표시 유지). */
+  actorId: string
+  actorName: string
+  actorAvatar?: string
+  /** 이동 대상 참조 — comment/reply=postId, dm/friend=상대 userId. */
+  ref?: string
+  /** 본문 발췌(서버가 길이 캡). */
+  text: string
+  createdAt: number
+  read: boolean
 }
 
 export interface ServerToClientEvents {
+  // ===== 커뮤니티 =====
+  // 게시판 목록·글 상세를 보고 있는 사람에게만 간다(룸: cmtyb:<게시판>, cmtyp:<글>).
+  'cmty:post': (e: { boardId: string; op: 'new' | 'update' | 'remove'; postId: string }) => void
+  'cmty:comment': (e: { postId: string; op: 'new' | 'edit' | 'remove'; comment?: unknown }) => void
+  // 권한이 바뀐 사람만 다시 받아야 한다(룸: acct:<계정>).
+  'cmty:perm': (e: { permVersion: number }) => void
+  // 테마·명칭은 공개 설정이라 커뮤니티 룸 전체로. 세션방 참가자에게 새지 않도록 전역 emit 은 쓰지 않는다.
+  'cmty:theme': (e: { theme: unknown }) => void
+  'cmty:labels': (e: { labels: unknown }) => void
   'room:participants': (participants: Participant[]) => void
+  // GM 명단이 바뀜(지정·해제·양도) — 방 전체에. 참가자 role 갱신은 room:participants 가 따로 싣는다.
+  'room:gm': (req: { ownerId: string; gmIds: string[] }) => void
   'chat:new': (message: ChatMessage) => void
   // 채팅 수정/삭제 브로드캐스트 — 대상자(공개 히스토리 수신자 전체)에게 반영.
   'chat:edited': (req: { id: string; text: string }) => void
@@ -1027,15 +1263,19 @@ export interface ServerToClientEvents {
   // ===== DM(유저 간 다이렉트 메시지) =====
   // 새 DM 도착 — 발신자·수신자 양쪽 개인룸으로(HTTP /dm/send 가 트리거).
   'dm:new': (message: DmMessage) => void
-  // DM 수정/삭제 — 발신자·수신자 양쪽 개인룸으로(HTTP /dm/edit·/dm/delete 가 트리거).
+  // DM 수정/삭제 — 발신자·수신자(그룹은 멤버 전원) 개인룸으로(HTTP /dm/edit·/dm/delete 가 트리거).
   'dm:edited': (message: DmMessage) => void
-  'dm:deleted': (req: { id: string; from: string; to: string }) => void
-  // DM 대화 개인 삭제 — 지운 사용자의 개인룸으로만(여러 세션 동기화용. 상대에겐 보내지 않음).
-  'dm:cleared': (req: { peer: string; by: string }) => void
-  // 상대 온라인/오프라인 전환(전체 브로드캐스트).
-  'dm:presence': (req: { userId: string; online: boolean }) => void
-  // 접속 직후 현재 온라인 사용자 목록(접속자에게만).
-  'dm:presence:init': (req: { online: string[] }) => void
+  'dm:deleted': (req: { id: string; from: string; to: string; threadId?: string }) => void
+  // DM 대화 개인 삭제 — 지운 사용자의 개인룸으로만(여러 세션 동기화용. 상대에겐 보내지 않음). 그룹은 threadId(peer='').
+  'dm:cleared': (req: { peer: string; by: string; threadId?: string }) => void
+  // 그룹 DM 메타 변경(생성/초대/나가기/계정탈퇴) — 멤버 전원(변동 당사자 포함) 개인룸으로. 클라는 /dm/list 재조회.
+  'dm:group:update': (req: { threadId: string }) => void
+  // 상대 온라인/오프라인·상태 전환(전체 브로드캐스트). status 는 online=true 일 때만(구클라는 무시).
+  'dm:presence': (req: { userId: string; online: boolean; status?: PublicPresenceStatus }) => void
+  // 접속 직후 스냅샷(접속자에게만). statuses=온라인 중 'online' 이 아닌 항목만. self=내 실상태(invisible 포함 — 본인 UI 시드).
+  'dm:presence:init': (req: { online: string[]; statuses?: Record<string, PublicPresenceStatus>; self?: PresenceStatus }) => void
+  // 새 알림 도착 — 대상 개인룸(user:<id>)으로만. 읽음은 서버 권위(HTTP /notif/read).
+  'notif:new': (n: NotifItem) => void
   // 관리자가 등급을 바꾸면 대상 사용자의 접속 세션에 즉시 푸시(재로그인 없이 권한 반영).
   'role:changed': (req: { role: 'admin' | 'member' | 'guest' }) => void
   // 관리자가 아이디(username)를 바꾸면 대상 사용자의 접속 세션에 즉시 푸시(재로그인 없이 표시 갱신).
@@ -1051,7 +1291,7 @@ export interface ServerToClientEvents {
   // 캐릭터 프레즌스 브로드캐스트.
   'char:state': (char: SharedCharacter) => void
   'char:expr': (msg: { playerId: string; index: number }) => void
-  // 캐릭터 시트 영속 : 계정의 전체 캐릭터 목록(연결 시 + 변경 시 계정 룸에 동기화).
+  // 캐릭터 시트 영속 — 계정의 전체 캐릭터 목록(연결 시 + 변경 시 계정 룸에 동기화).
   'char:library': (chars: CharacterRecord[]) => void
   // 관리자가 그 계정의 캐릭터를 전부 삭제 — 클라는 로컬 라이브러리를 비운다(빈 char:library 의 '시드 재업로드'와 구분).
   'char:wiped': () => void
@@ -1068,29 +1308,34 @@ export interface ServerToClientEvents {
   'room:closed': (reason: string) => void
   // 외형 브로드캐스트: 방 GM 변경 시 방 전체에 강제 적용.
   'room:appearance': (ap: Appearance) => void
-  // 방 주사위 연출 카드 브로드캐스트 : GM 설정 시 전원에 동기화(level=성공 단계, 없으면 공통).
+  // 방 주사위 연출 카드 브로드캐스트 — GM 설정 시 전원에 동기화(level=성공 단계, 없으면 공통).
   'room:cutin': (req: { image?: string; level?: SuccessLevel }) => void
-  // GM 화면 강제 이동 브로드캐스트 : 맵/비주얼노벨 탭 + (있으면)그 맵으로 전환(대상=전원 또는 지정 인원).
+  // GM 화면 강제 이동 브로드캐스트 — 맵/비주얼노벨 탭 + (있으면)그 맵으로 전환(대상=전원 또는 지정 인원).
   'room:view': (req: { view: 'map' | 'vn'; mapId?: string }) => void
   // 각 플레이어의 현재 맵 위치·뷰 집계 — GM 에게만 전달. positions[playerId]=mapId, views[playerId]=map|vn.
   'room:positions': (req: { positions: Record<string, string>; views?: Record<string, 'map' | 'vn'> }) => void
-  // ~문장~ 행동지문 색 브로드캐스트 : GM 설정 시 전원 동기화(빈값=해제).
+  // ~문장~ 행동지문 색 브로드캐스트 — GM 설정 시 전원 동기화(빈값=해제).
   'room:dim': (req: { color?: string }) => void
   'room:luck': (req: { enabled: boolean }) => void
-  // VN 오버레이 표시 브로드캐스트 : GM 토글 시 전원 동기화.
+  /** 입실 잠금(공사중) — 방을 만든 사람만 켜고 끈다. 켜면 새로 들어오는 사람을 막는다. */
+  'room:lock': (req: { locked: boolean }) => void
+  // VN 오버레이 표시 브로드캐스트 — GM 토글 시 전원 동기화.
   'room:vnoverlay': (req: { enabled: boolean }) => void
-  // GM 커스텀 광기표 브로드캐스트 .
+  // GM 전용: GM 귓속말 열람 토글. 켠 뒤에 오가는 귓속말만 GM 에게 열린다(지난 말은 소급 열람 없음).
+  'room:gmwhisper': (req: { enabled: boolean }) => void
+  // GM 커스텀 광기표 브로드캐스트.
   'room:madness': (req: MadnessTables) => void
   // BGM 브로드캐스트 (다중). state=트랙 목록 전체(소스 포함·추가/제거 시), control=경량 트랙 토글(재생/반복/볼륨).
-  'bgm:state': (tracks: BgmState[]) => void
-  'bgm:control': (req: { trackId: string; playing: boolean; loop: boolean; volume: number }) => void
+  // roomId=발신 방 표식 — 수신 클라가 자기 방 방송인지 검증(방 이동 직후 이전 방 음악이 새는 것 차단). 구클라는 무시.
+  'bgm:state': (tracks: BgmState[], roomId?: string) => void
+  'bgm:control': (req: { trackId: string; playing: boolean; loop: boolean; volume: number }, roomId?: string) => void
   // BGM 시크 브로드캐스트 (GM 전용). 전원의 오디오를 지정 위치(초)로 점프 — 위치는 저장 안 함(transient).
-  'bgm:seek': (req: { trackId: string; position: number }) => void
-  // 전투 브로드캐스트 . GM 변경 시 전원에 동기화. null=전투 종료.
+  'bgm:seek': (req: { trackId: string; position: number }, roomId?: string) => void
+  // 전투 브로드캐스트 — GM 변경 시 전원에 동기화. null=전투 종료.
   'combat:state': (state: CombatState | null) => void
-  // 그룹 채널 목록 . 수신자가 멤버이거나 GM 인 채널만(개설/삭제 시 갱신).
+  // 그룹 채널 목록 — 수신자가 멤버이거나 GM 인 채널만(개설/삭제 시 갱신).
   'channel:list': (channels: Channel[]) => void
-  // 방 불러오기 풀 재싱크 . 적용된 방 스냅샷(핸드아웃은 수신자 기준 필터).
+  // 방 불러오기 풀 재싱크 — 적용된 방 스냅샷(핸드아웃은 수신자 기준 필터).
   'room:sync': (room: RoomState) => void
   // 핸드아웃 브로드캐스트 (대상 필터링됨). focus = 강제 포커스(대상 화면에 모달 자동 오픈).
   'handout:state': (handout: Handout) => void
@@ -1099,6 +1344,11 @@ export interface ServerToClientEvents {
   // 맵·토큰 브로드캐스트 (방 전체). 콘텐츠는 mapId 로 대상 맵 명시.
   'map:added': (map: GameMap) => void
   'map:slots': (req: { slots: { id: string; name: string; savedAt: number }[] }) => void
+  // 덱 브로드캐스트 — state=한 덱의 공개본 갱신, remove=삭제.
+  // state 는 사람마다 보이는 몫이 달라(감춘 목록·비밀 뽑기) 개인 룸으로, remove 는 방 전체로 나간다.
+  // 둘 다 방 표식을 실어, 방을 옮긴 직후 이전 방의 덱이 새 화면에 꽂히는 것을 막는다(BGM 방송과 같은 규약).
+  'deck:state': (req: { deck: DeckView; roomId: string }) => void
+  'deck:remove': (req: { id: string; roomId: string }) => void
   'room:cards': (req: { cards: VisualCard[] }) => void
   'room:cardplay': (req: { card: VisualCard }) => void
   'map:removed': (req: { mapId: string }) => void
@@ -1122,11 +1372,11 @@ export interface ServerToClientEvents {
   'token:resize': (req: TokenResizeReq) => void
   'token:imageindex': (req: TokenImageIndexReq) => void
   'token:remove': (req: { mapId: string; id: string }) => void
-  // 자유 드로잉·핑 브로드캐스트 . draw=새 획(서버 스탬프), ping=휘발(저장 안 함).
+  // 자유 드로잉·핑 브로드캐스트 — draw=새 획(서버 스탬프), ping=휘발(저장 안 함).
   'map:draw': (req: { mapId: string; stroke: Stroke }) => void
   'map:draw:erase': (req: { mapId: string; strokeId: string }) => void
   'map:draw:clear': (req: { mapId: string }) => void
-  // 맵 텍스트 브로드캐스트 . state=신규/편집(서버 스탬프), move=이동, remove=삭제, clear=전체 지우기.
+  // 맵 텍스트 브로드캐스트 — state=신규/편집(서버 스탬프), move=이동, remove=삭제, clear=전체 지우기.
   'map:text:state': (req: { mapId: string; text: MapText }) => void
   'map:text:move': (req: { mapId: string; id: string; x: number; y: number }) => void
   'map:text:remove': (req: { mapId: string; id: string }) => void
@@ -1155,6 +1405,8 @@ export interface SocketData {
   plazaId?: string
   /** 현재 방문 중인 마이룸 id(=방 주인 id, 없으면 방문 아님). 휘발 — disconnect 시 서버가 정리. */
   visitRoomId?: string
+  /** 커뮤니티에서 지금 소속된 소켓룸 목록. 화면을 옮길 때 통째로 갈아끼워 소속이 쌓이지 않게 한다. */
+  cmtyRooms?: string[]
   /** 인증된 계정(비인증 레거시/테스트면 없음). 전역 등급 admin/member/guest. */
   account?: { id: string; username: string; role: 'admin' | 'member' | 'guest' }
 }

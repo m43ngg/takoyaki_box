@@ -97,7 +97,7 @@ export interface SessionLogSummary {
 export interface SessionLogDetail extends SessionLogSummary {
   html: string
 }
-/** 작성/수정 입력. id 없으면 새 백업(html 필요), id 있으면 메타만 수정(본문 불변). */
+/** 작성/수정 입력. id 없으면 새 백업(html 필요), id 있으면 수정 — html 은 보낼 때만 본문 교체(로비 편집기). */
 export interface SessionLogInput {
   id?: string
   boardId?: string
@@ -115,7 +115,9 @@ export interface SessionLogStore {
   listFor(viewerId: string | null, targetId: string): { logs: SessionLogSummary[]; boards: Board[] }
   /** 로그 상세 — 비공개는 작성자만. 권한 없으면 null. */
   get(viewerId: string | null, logId: string): { log: SessionLogDetail } | null
-  /** 백업 생성(html 필요) 또는 메타 수정(id 소유 — 본문 불변). */
+  /** 이 로그의 주인 계정 id — 본문을 내주기 전에 로비 열람 권한을 물어보는 데 쓴다. 없는 로그면 null. */
+  ownerOf(logId: string): string | null
+  /** 백업 생성(html 필요) 또는 수정(id 소유 — html 은 보낼 때만 본문 교체). */
   save(authorId: string, input: SessionLogInput): SessionLogSaveResult
   /** 삭제(작성자). */
   remove(authorId: string, logId: string): boolean
@@ -189,7 +191,7 @@ export function createSessionLogStore(opts?: { dataDir?: string; persist?: boole
         if (data.boards && typeof data.boards === 'object') boards = data.boards
       }
     } catch (e) {
-      console.error('[sessionlogs] sessionlogs.json 로드 실패 — 빈 목록으로 시작:', e)
+      console.error('[sessionlogs] sessionlogs.json 로드 실패. 빈 목록으로 시작:', e)
     }
   }
 
@@ -247,6 +249,10 @@ export function createSessionLogStore(opts?: { dataDir?: string; persist?: boole
       return { log: detail(l) }
     },
 
+    ownerOf(logId) {
+      return findLog(logId)?.authorId ?? null
+    },
+
     save(authorId, input) {
       if (!authorId) return { ok: false, error: '로그인이 필요합니다.' }
       const title = typeof input.title === 'string' ? input.title.trim().slice(0, MAX_TITLE) : ''
@@ -256,11 +262,19 @@ export function createSessionLogStore(opts?: { dataDir?: string; persist?: boole
       const boardId = resolveBoardId(authorId, input.boardId)
       const now = Date.now()
 
-      // 메타 수정 — 본문(html)은 백업 시점 캡처라 불변. 제목·게시판·태그·대표이미지·공개범위만 갱신.
+      // 수정 — 제목·게시판·태그·대표이미지·공개범위 갱신 + (로비 편집기가 html 을 보내면) 본문도 교체.
       if (input.id) {
         const l = findLog(input.id)
         if (!l) return { ok: false, error: '세션 로그를 찾을 수 없습니다.' }
         if (l.authorId !== authorId) return { ok: false, error: '수정 권한이 없습니다.' }
+        // 본문 편집(로비 편집기 — 문구 수정·행 삭제·이미지/꾸밈 삽입). 새 백업과 동일한 새니타이저를
+        // 재통과시키고 목록 용량 표시(size)도 재계산한다. html 미포함(메타만 수정)이면 본문 불변.
+        if (typeof input.html === 'string') {
+          const h = sanitizeLogHtml(input.html)
+          if (!h) return { ok: false, error: '본문이 비어 있습니다.' }
+          l.html = h
+          l.size = h.length
+        }
         l.title = title || l.title // 제목을 비우면 기존 제목 유지(무제 백업 방지)
         l.tags = tags
         l.visibility = visibility

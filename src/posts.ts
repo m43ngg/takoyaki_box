@@ -5,6 +5,7 @@ import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync } from '
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { collectAssetRefs as scanAssetRefs } from './assets'
+import { htmlToText } from './htmlText'
 
 // ===== 한도(작은 서버 보호) =====
 const MAX_POSTS_PER_USER = 500
@@ -22,7 +23,10 @@ const MAX_COVER = 1_400_000 // 대표 이미지 data URL 상한(보통은 asset 
 // 에디터가 생성하는 서식 태그만 허용. 그 외 태그는 마커만 제거(텍스트는 보존). 위험 요소는 통째 제거.
 const ALLOWED_TAGS = new Set([
   'p', 'br', 'div', 'span', 'b', 'strong', 'i', 'em', 'u', 's', 'strike',
-  'blockquote', 'h1', 'h2', 'h3', 'h4', 'ul', 'ol', 'li', 'a', 'img', 'hr', 'code', 'pre'
+  'blockquote', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol', 'li', 'a', 'img', 'hr', 'code', 'pre',
+  // 위·아래 첨자와 형광 표시 — 편집기 툴바가 내는 서식.
+  // font 는 넣지 않는다 — 색·크기를 속성으로 들고 오는데 속성은 전부 걷어내므로 빈 껍데기만 남는다.
+  'sub', 'sup', 'mark'
 ])
 // 여는~닫는 태그를 통째로 제거할 위험 요소(스크립트·스타일·삽입 프레임 등).
 const DROP_BLOCKS = [
@@ -30,12 +34,26 @@ const DROP_BLOCKS = [
   'embed', 'svg', 'math', 'form', 'head', 'link', 'meta', 'base', 'button', 'input', 'select'
 ]
 // 허용 인라인 style 속성 — 값에 url(/expression/주석/스킴 없을 때만(CSS 주입 차단).
-// width/max-width=본문 이미지 크기 조절, border-color=구분선(hr) 색.
+// width/max-width=본문 이미지 크기 조절, border-color=구분선(hr) 색,
+// margin/padding/border=들여쓰기(인용 블록), float/display=본문 이미지 정렬.
 const ALLOWED_STYLE_PROPS = new Set([
   'text-align', 'color', 'background-color', 'font-size', 'font-weight',
-  'font-style', 'text-decoration', 'font-family', 'line-height',
-  'width', 'max-width', 'border-color', 'border-top-color'
+  'font-style', 'text-decoration', 'font-family', 'line-height', 'letter-spacing',
+  'width', 'max-width', 'height', 'border-color', 'border-top-color',
+  'margin', 'margin-left', 'margin-right', 'margin-top', 'margin-bottom',
+  'padding', 'padding-left', 'text-indent', 'border', 'float', 'clear',
+  'display', 'vertical-align'
 ])
+/**
+ * 음수를 받아서는 안 되는 속성 — 여백을 크게 음수로 주면 본문이 글 밖으로 삐져나가
+ * 다른 화면 요소를 덮는다. 글쓴이가 남의 화면을 가리는 길을 열지 않는다.
+ */
+const NO_NEGATIVE_PROPS = new Set([
+  'margin', 'margin-left', 'margin-right', 'margin-top', 'margin-bottom',
+  'padding', 'padding-left', 'text-indent', 'width', 'max-width', 'height', 'letter-spacing'
+])
+/** display 는 이미지 정렬(가운데=block)에만 쓴다 — 그 밖의 값은 받지 않는다. */
+const DISPLAY_VALUES = new Set(['block', 'inline', 'inline-block', 'none'])
 
 /** 속성값 이스케이프(쌍따옴표 컨텍스트). */
 function escAttr(s: string): string {
@@ -69,6 +87,9 @@ function sanitizeStyle(v: string): string {
     if (!ALLOWED_STYLE_PROPS.has(prop)) continue
     const value = decl.slice(idx + 1).trim()
     if (/url\s*\(|expression|javascript:|@import|\/\*|<|>/i.test(value)) continue
+    // 음수 여백은 본문 밖으로 내용을 밀어 다른 화면을 덮는 데 쓰인다.
+    if (NO_NEGATIVE_PROPS.has(prop) && /-\s*[\d.]/.test(value)) continue
+    if (prop === 'display' && !DISPLAY_VALUES.has(value.toLowerCase())) continue
     const clean = value.slice(0, 120).replace(/["']/g, '')
     if (clean) out.push(`${prop}: ${clean}`)
   }
@@ -102,9 +123,22 @@ function sanitizeAttrs(tag: string, raw: string): string {
   return out.length ? ' ' + out.join(' ') : ''
 }
 
+/**
+ * 정규화 결과 길이의 하드 상한. 입력은 이미 MAX_HTML 로 자르지만, 아래에서 남은 '<' 를 '&lt;' 로 바꾸므로
+ * 최악(전부 '<')에는 4배까지 늘 수 있다. 토큰 경계에서만 끊어 태그가 반토막 나지 않게 한다.
+ */
+const MAX_HTML_OUT = MAX_HTML * 2
+
+/** 태그로 해석되지 않은 잔여 '<' 를 무해한 문자로. 이미 재작성된 허용 태그에는 닿지 않는다(조각 단위로만 호출). */
+function escapeLooseLt(s: string): string {
+  return s.replace(/</g, '&lt;')
+}
+
 /** 본문 HTML 을 화이트리스트로 정규화 — 저장 전 1회. 타인 열람용이라 저장형 XSS 의 유일한 차단막. */
 export function sanitizePostHtml(input: unknown): string {
   if (typeof input !== 'string') return ''
+  // 길이 제한은 '들어올 때' 한 번만 건다. 정규화가 끝난 뒤에 자르면 안전하게 재작성된 태그가
+  // 절단면에서 다시 미종료 태그가 되어, 렌더 시 뒤따르는 마크업이 속성으로 빨려 들어간다.
   let html = input.slice(0, MAX_HTML)
   // 1) 주석·CDATA 제거.
   html = html.replace(/<!--[\s\S]*?-->/g, '')
@@ -115,26 +149,31 @@ export function sanitizePostHtml(input: unknown): string {
     html = html.replace(new RegExp(`<\\/${t}\\s*>`, 'gi'), '')
   }
   // 3) 태그 단위 재작성 — 비허용 태그는 마커 제거(내부 텍스트 보존), 허용 태그는 속성 정규화.
-  html = html.replace(/<(\/?)([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>/g, (_full, slash: string, rawName: string, rawAttrs: string) => {
-    const name = rawName.toLowerCase()
-    if (!ALLOWED_TAGS.has(name)) return ''
-    if (slash) return `</${name}>`
-    return `<${name}${sanitizeAttrs(name, rawAttrs)}>`
-  })
-  return html.slice(0, MAX_HTML)
+  //    태그 사이 조각은 이스케이프한다. '>' 로 닫히지 않은 조각(예: '<img src=x onerror=…' 처럼 끝이 잘린 것)은
+  //    태그로 매칭되지 않아 이 조각에 남으므로, 여기서 함께 무해해진다.
+  const tagRe = /<(\/?)([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>/g
+  let out = ''
+  let last = 0
+  let m: RegExpExecArray | null
+  while ((m = tagRe.exec(html))) {
+    out += escapeLooseLt(html.slice(last, m.index))
+    last = tagRe.lastIndex
+    const name = m[2].toLowerCase()
+    if (ALLOWED_TAGS.has(name)) {
+      out += m[1] ? `</${name}>` : `<${name}${sanitizeAttrs(name, m[3])}>`
+    }
+    if (out.length > MAX_HTML_OUT) return out // 토큰 경계 — 태그가 쪼개지지 않는다
+  }
+  out += escapeLooseLt(html.slice(last))
+  // 여기까지 왔다면 초과분은 전부 마지막 텍스트 조각에서 나온 것이다(태그를 붙일 때마다 위에서 검사했으므로).
+  // 텍스트를 자르는 것은 주입 위험이 없다 — 반쪽으로 잘린 문자 참조만 정리한다.
+  if (out.length > MAX_HTML_OUT) out = out.slice(0, MAX_HTML_OUT).replace(/&[a-z]{0,3}$/i, '')
+  return out
 }
 
-/** 본문에서 평문 발췌(목록 표시용) — 태그 제거 후 공백 정리. */
+/** 본문에서 평문 발췌(목록 표시용). */
 function excerptOf(html: string): string {
-  return html
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&amp;/gi, '&') // &amp; 는 마지막에(먼저 풀면 &amp;lt; → < 로 이중 디코드)
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 140)
+  return htmlToText(html, 140)
 }
 
 // ===== 모델 =====
@@ -150,6 +189,8 @@ export interface PostComment {
   text: string
   createdAt: number
   updatedAt?: number
+  /** 답글이면 부모(최상위) 댓글 id. 1단 깊이만 — 답글의 답글은 같은 부모에 매달린다. 기존 댓글엔 없음(=최상위). */
+  parentId?: string
 }
 export interface Post {
   id: string
@@ -217,14 +258,22 @@ export interface PostStore {
   listFor(viewerId: string | null, targetId: string): { posts: PostSummary[]; boards: Board[] }
   /** 글 상세 — 비공개/임시저장은 작성자만. 권한 없으면 null. */
   get(viewerId: string | null, postId: string): { post: PostDetail; liked: boolean } | null
+  /** 이 글의 주인 계정 id — 글 자체를 내주기 전에 로비 열람 권한을 물어보는 데 쓴다. 없는 글이면 null. */
+  ownerOf(postId: string): string | null
   /** 작성/수정(작성자) — id 있고 소유면 수정, 아니면 새 글. */
   save(authorId: string, input: PostInput): PostSaveResult
   /** 글 삭제(작성자). 삭제했으면 true. */
   remove(authorId: string, postId: string): boolean
   /** 좋아요 토글(로그인 누구나). 대상 열람 권한 있을 때만. */
   toggleLike(userId: string, postId: string): { liked: boolean; count: number } | null
-  /** 댓글 작성(로그인 누구나) — 작성자 표시정보는 스냅샷. */
-  addComment(author: { id: string; name: string; avatar?: string }, postId: string, text: string): PostComment | null
+  /** 댓글 작성(로그인 누구나) — 작성자 표시정보는 스냅샷. parentId 가 유효한 최상위 댓글이면 답글로.
+   *  반환에 글 메타(주인·제목)와 부모 작성자를 동봉 — 호출부(알림 생성)가 재조회 없이 쓴다. */
+  addComment(
+    author: { id: string; name: string; avatar?: string },
+    postId: string,
+    text: string,
+    parentId?: string
+  ): { comment: PostComment; post: { id: string; authorId: string; title: string }; parentAuthorId?: string } | null
   /** 댓글 수정(댓글 작성자만). */
   editComment(userId: string, postId: string, commentId: string, text: string): PostComment | null
   /** 댓글 삭제(댓글 작성자 또는 글 주인). */
@@ -281,7 +330,7 @@ export function createPostStore(opts?: { dataDir?: string; persist?: boolean }):
         if (data.boards && typeof data.boards === 'object') boards = data.boards
       }
     } catch (e) {
-      console.error('[posts] posts.json 로드 실패 — 빈 목록으로 시작:', e)
+      console.error('[posts] posts.json 로드 실패. 빈 목록으로 시작:', e)
     }
   }
 
@@ -350,6 +399,10 @@ export function createPostStore(opts?: { dataDir?: string; persist?: boolean }):
       const p = findPost(postId)
       if (!p || !canView(viewerId, p)) return null
       return { post: detail(p), liked: !!viewerId && p.likes.includes(viewerId) }
+    },
+
+    ownerOf(postId) {
+      return findPost(postId)?.authorId ?? null
     },
 
     save(authorId, input) {
@@ -437,24 +490,34 @@ export function createPostStore(opts?: { dataDir?: string; persist?: boolean }):
       return { liked, count: p.likes.length }
     },
 
-    addComment(author, postId, text) {
+    addComment(author, postId, text, parentId) {
       if (!author?.id) return null
       const p = findPost(postId)
       if (!p || !canView(author.id, p)) return null
       const msg = (text ?? '').trim().slice(0, MAX_COMMENT)
       if (!msg) return null
+      // 답글 검증 — 같은 글의 '최상위' 댓글만 부모가 될 수 있다(1단 깊이 강제). 무효하면 최상위 댓글로 저장.
+      const parent =
+        typeof parentId === 'string' && parentId
+          ? p.comments.find((x) => x.id === parentId && !x.parentId)
+          : undefined
       const comment: PostComment = {
         id: randomUUID(),
         authorId: author.id,
         authorName: (author.name || '익명').slice(0, 60),
         authorAvatar: author.avatar,
         text: msg,
-        createdAt: Date.now()
+        createdAt: Date.now(),
+        ...(parent ? { parentId: parent.id } : {})
       }
       p.comments.push(comment)
       if (p.comments.length > MAX_COMMENTS) p.comments.splice(0, p.comments.length - MAX_COMMENTS)
       save()
-      return comment
+      return {
+        comment,
+        post: { id: p.id, authorId: p.authorId, title: p.title },
+        parentAuthorId: parent?.authorId
+      }
     },
 
     editComment(userId, postId, commentId, text) {
@@ -477,7 +540,8 @@ export function createPostStore(opts?: { dataDir?: string; persist?: boolean }):
       if (!c) return false
       // 댓글 작성자 또는 글 주인만 삭제.
       if (c.authorId !== userId && p.authorId !== userId) return false
-      p.comments = p.comments.filter((x) => x.id !== commentId)
+      // 부모 댓글을 지우면 매달린 답글도 함께 제거(부모 없는 답글 잔존 방지).
+      p.comments = p.comments.filter((x) => x.id !== commentId && x.parentId !== commentId)
       save()
       return true
     },
@@ -514,10 +578,11 @@ export function createPostStore(opts?: { dataDir?: string; persist?: boolean }):
       const before = posts.length
       posts = posts.filter((p) => p.authorId !== userId)
       if (posts.length !== before) changed = true
-      // 타인 글에 남긴 이 사용자의 댓글·좋아요 제거.
+      // 타인 글에 남긴 이 사용자의 댓글·좋아요 제거. 지워진 부모에 매달린 답글도 함께 정리(고아 방지).
       for (const p of posts) {
         const cl = p.comments.length
-        p.comments = p.comments.filter((c) => c.authorId !== userId)
+        const removedIds = new Set(p.comments.filter((c) => c.authorId === userId).map((c) => c.id))
+        p.comments = p.comments.filter((c) => c.authorId !== userId && !(c.parentId && removedIds.has(c.parentId)))
         if (p.comments.length !== cl) changed = true
         const li = p.likes.indexOf(userId)
         if (li >= 0) {
@@ -589,7 +654,9 @@ export function createPostStore(opts?: { dataDir?: string; persist?: boolean }):
                 authorAvatar: typeof c.authorAvatar === 'string' ? c.authorAvatar.slice(0, 1_000_000) : undefined,
                 text,
                 createdAt: typeof c.createdAt === 'number' ? c.createdAt : now,
-                ...(typeof c.updatedAt === 'number' ? { updatedAt: c.updatedAt } : {})
+                ...(typeof c.updatedAt === 'number' ? { updatedAt: c.updatedAt } : {}),
+                // 답글 관계 보존(댓글 id 는 원본 유지라 그대로 유효). 부모 미존재 시 렌더가 최상위 폴백.
+                ...(typeof c.parentId === 'string' ? { parentId: c.parentId.slice(0, 64) } : {})
               })
             }
           }

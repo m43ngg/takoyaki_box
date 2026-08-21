@@ -1,5 +1,4 @@
-// 이 파일은 렌더러 src/renderer/src/lib/dice/types.ts 의 미러본입니다.
-//    다이스 규칙/타입 변경 시 양쪽을 함께 수정하세요.
+// 렌더러 src/renderer/src/lib/dice/types.ts 의 미러본. 다이스 규칙·타입 변경 시 양쪽을 함께 고친다.
 // ===== 다이스/판정 결과 타입 =====
 
 export type SuccessLevel =
@@ -36,6 +35,8 @@ export interface SanResult {
   level: SuccessLevel
   success: boolean
   loss: number // 실제 SAN 손실량
+  /** 손실을 굴려서 정했다면 그 눈(1d6 등) — 고정값이면 없음. */
+  lossRolls?: number[]
   lossExpr: string // 손실 식 ("1/1d6")
 }
 
@@ -45,6 +46,8 @@ export interface SumResult {
   command: string
   /** 표시용 이름 — 시트에서 굴린 무기 피해 등(예: "권총 피해"). 카드 상단에 표기. */
   name?: string
+  /** 굴린 원본 식("1d6+2") — 이름을 단 굴림은 command 가 이름으로 덮이므로 식을 따로 남긴다. */
+  expr?: string
   rolls: number[]
   modifier: number
   total: number
